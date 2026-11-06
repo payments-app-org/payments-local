@@ -1,0 +1,303 @@
+# Всё приложение локально: Postgres, Kafka, микросервисы и фронтенд. Сервисы собираются из соседних папок
+# (../payments-<сервис>) — их клонирует scripts/clone-all.sh. Имя проекта прежнее: тома с данными те же.
+name: payments-app
+
+x-quote-secret: &quote-secret
+  # Секреты — из .env (шаблон — .env.example); без них compose не запустится
+  QUOTE_SECRET: ${QUOTE_SECRET:?задайте QUOTE_SECRET в .env, см. .env.example}
+
+# Healthcheck сервисов: readiness из Actuator (БД и Redis на месте); start_period — время на старт JVM и миграции
+x-app-health: &app-health
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 60s
+
+services:
+  postgres:
+    restart: unless-stopped
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  kafka:
+    restart: unless-stopped
+    image: apache/kafka:4.3.2
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # kafka:9092 — для сервисов внутри docker, localhost:29092 — для подключения с компьютера
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Топик, созданный автоматически (консьюмер подписался раньше, чем продюсер его объявил, или DLT), —
+      # сразу с тремя партициями, как объявленные
+      KAFKA_NUM_PARTITIONS: 3
+    # Сообщения переживают перезапуск Docker: без тома события пропадали
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  # Кэш, блокировки планировщиков (ShedLock), итоги заглушек
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Веб-интерфейс для просмотра топиков и сообщений: http://localhost:8090
+  kafka-ui:
+    restart: unless-stopped
+    image: kafbat/kafka-ui:v1.5.0
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  account:
+    restart: unless-stopped
+    build:
+      context: ../payments-account
+      secrets: [github_token]
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      CARD_HMAC_KEY: ${CARD_HMAC_KEY:?задайте CARD_HMAC_KEY в .env, см. .env.example}
+      CARD_ENCRYPTION_KEY: ${CARD_ENCRYPTION_KEY:?задайте CARD_ENCRYPTION_KEY в .env, см. .env.example}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/actuator/health/readiness"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pricing:
+    restart: unless-stopped
+    build:
+      context: ../payments-pricing
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+      <<: *quote-secret
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      ACCOUNT_URL: http://account:8081
+      BILLER_URL: http://biller:8087
+    ports:
+      - "8082:8082"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/actuator/health/readiness"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  payment:
+    restart: unless-stopped
+    build:
+      context: ../payments-payment
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+      <<: *quote-secret
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      KAFKA_BOOTSTRAP: kafka:9092
+      ACCOUNT_URL: http://account:8081
+      FRAUD_URL: http://fraud:8084
+      BILLER_URL: http://biller:8087
+      PROCESSING_URL: http://processing:8085
+    ports:
+      - "8083:8083"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/actuator/health/readiness"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  history:
+    restart: unless-stopped
+    build:
+      context: ../payments-history
+      secrets: [github_token]
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports:
+      - "8086:8086"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8086/actuator/health/readiness"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # Справочники поставщиков: страны и способы переводов за рубеж, госуслуги
+  biller:
+    restart: unless-stopped
+    build:
+      context: ../payments-biller
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      GIS_GMP_URL: http://providers:8088
+      GATEWAY_URL: http://providers:8088
+      PROCESSING_URL: http://processing:8085
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports:
+      - "8087:8087"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8087/actuator/health/readiness"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Шаблоны платежей и автоплатежи: хранит их и по расписанию создаёт платежи в payment
+  autopayments:
+    restart: unless-stopped
+    build:
+      context: ../payments-autopayments
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      ACCOUNT_URL: http://account:8081
+      PRICING_URL: http://pricing:8082
+      PAYMENT_URL: http://payment:8083
+      BILLER_URL: http://biller:8087
+    ports:
+      - "8089:8089"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8089/actuator/health/readiness"]
+    # Планировщик с первых секунд ходит к соседям — ждём, пока они будут готовы
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      account:
+        condition: service_healthy
+      pricing:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      biller:
+        condition: service_healthy
+
+  # Заглушки сторонних поставщиков: ГИС ГМП (госуслуги) и другие
+  providers:
+    restart: unless-stopped
+    build:
+      context: ../payments-providers
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+    ports:
+      - "8088:8088"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/actuator/health/readiness"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  fraud:
+    restart: unless-stopped
+    build:
+      context: ../payments-fraud
+      secrets: [github_token]
+    ports:
+      - "8084:8084"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8084/actuator/health/readiness"]
+
+  processing:
+    restart: unless-stopped
+    build:
+      context: ../payments-processing
+      secrets: [github_token]
+    environment:
+      REDIS_HOST: redis
+      # Итоги долгих переводов и входящие СБП процессинг присылает в payment
+      PAYMENT_URL: http://payment:8083
+    ports:
+      - "8085:8085"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8085/actuator/health/readiness"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    restart: unless-stopped
+    build: ../payments-frontend
+    environment:
+      ACCOUNT_URL: http://account:8081
+      PRICING_URL: http://pricing:8082
+      PAYMENT_URL: http://payment:8083
+      HISTORY_URL: http://history:8086
+      BILLER_URL: http://biller:8087
+      AUTOPAYMENTS_URL: http://autopayments:8089
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../payments-frontend:/app
+      - /app/node_modules
+
+volumes:
+  pgdata:
+  kafkadata:
+
+# Токен для скачивания payments-platform из GitHub Packages при сборке образов — секретом сборки, в образ не попадает.
+# Берётся из переменной GITHUB_TOKEN (scripts/up.sh подставляет его из gh auth token)
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN

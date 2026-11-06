@@ -1,0 +1,23 @@
+# Проверка docker-compose.yml (синтаксис, подстановки, ссылки на секреты) и скриптов рабочего места
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: docker compose config
+        run: |
+          cp .env.example .env
+          sed -i 's/^\(QUOTE_SECRET\|CARD_HMAC_KEY\|CARD_ENCRYPTION_KEY\)=$/\1=ci-placeholder/' .env
+          docker compose config -q
+      - name: shellcheck
+        run: cd scripts && shellcheck -x ./*.sh

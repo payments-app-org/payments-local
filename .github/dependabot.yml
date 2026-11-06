@@ -1,0 +1,16 @@
+# Образы инфраструктуры в docker-compose.yml (Postgres, Kafka, Redis): только обновления внутри мажорной версии
+version: 2
+updates:
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
