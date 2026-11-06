@@ -278,7 +278,10 @@ services:
 
   web:
     restart: unless-stopped
-    build: ../payments-frontend
+    # Цель dev — dev-сервер Vite с правками на лету; образ по умолчанию — боевой nginx (для Kubernetes)
+    build:
+      context: ../payments-frontend
+      target: dev
     environment:
       ACCOUNT_URL: http://account:8081
       PRICING_URL: http://pricing:8082
