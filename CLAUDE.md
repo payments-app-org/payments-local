@@ -9,7 +9,7 @@
 1. **Ветка** — правим нужный репозиторий в своей ветке (не в `main`).
 2. **Проверяем локально** — поднимаем всё в Docker (`payments-local/scripts/up.sh`) и смотрим на http://localhost:5173. Всё должно работать до коммита.
 3. **PR** — `git push` ветки → pull request в `main` этого репозитория. CI репозитория собирает и тестирует сервис; сливаем одним коммитом (squash), когда проверка `ci / ok` зелёная. `main` защищён: без зелёного `ci / ok` коммит туда не попадёт — ни через PR, ни прямым push, в том числе у владельца; force push и удаление ветки запрещены.
-4. **После слияния** CI публикует образ сервиса `ghcr.io/payments-app-org/payments-<сервис>:<sha>` (и `:main`) и выкатывает его: записывает `<sha>` в [`payments-deploy`](https://github.com/payments-app-org/payments-deploy) (`services/<сервис>.yaml`), Argo CD в кластере видит коммит и обновляет только этот сервис — http://payments.localhost. На push в ветку без PR CI не запускается.
+4. **После слияния** CI снова проверяет сервис и публикует образ `ghcr.io/payments-app-org/payments-<сервис>:<sha>` (и `:main`) в GitHub Container Registry. **Выкатка — по кнопке**: задача `deploy` ждёт подтверждения окружения `prod` (в запуске CI — Review deployments → prod → Approve and deploy; аналог `when: manual` в GitLab), затем записывает `<sha>` в [`payments-deploy`](https://github.com/payments-app-org/payments-deploy) (`envs/prod/services/<сервис>.yaml`), Argo CD в кластере видит коммит и обновляет только этот сервис — http://payments.localhost. На push в ветку без PR CI не запускается.
 
 Изменение затрагивает несколько сервисов (новое поле в API) — PR в каждый репозиторий; сначала тот, кто отдаёт данные, потом тот, кто их читает: сервисы выкатываются независимо и должны работать со старой версией соседа.
 
@@ -32,6 +32,7 @@
   payments-biller/        справочники и интеграции с поставщиками: переводы за рубеж, госуслуги      :8087
   payments-providers/     заглушки сторонних поставщиков (шлюзы, ГИС ГМП)                          :8088
   payments-autopayments/  шаблоны платежей и автоплатежи                                           :8089
+  payments-gateway/       API Gateway: единственный вход в API (Spring Cloud Gateway)               :8080
   payments-frontend/      React + Vite + TypeScript; design/ — макеты (reference-*.png)            :5173
 ```
 
@@ -46,7 +47,7 @@ Java-сервисы: Java 21, Spring Boot 4, Maven. Каждый сервис �
 - **сервис** (`java-service.yml`): `mvn verify` (unit + интеграционные на Testcontainers) → Trivy по зависимостям (отказ на исправимых CRITICAL) → сборка образа → Trivy по образу (пакеты ОС и `app.jar`) → в `main` публикация в GHCR. В PR образ только собирается и проверяется — так проверяется и Dockerfile. Упали тесты — отчёты в артефактах запуска (7 дней).
 - **библиотека** (`java-library.yml`): `mvn verify`, Trivy; тег `vX.Y.Z`, совпадающий с версией в `pom.xml`, — публикация версии в GitHub Packages.
 - **фронтенд** (`frontend.yml`): `npm ci`, `npm run build` (проверка типов и сборка), Trivy, образ (nginx со статикой; цель `dev` Dockerfile — dev-сервер Vite для compose) → Trivy по образу → в `main` публикация.
-- **выкатка** (`deploy.yml`, вызывают шаблоны сервиса и фронтенда в `main` после публикации образа): тег образа — в `payments-deploy/services/<сервис>.yaml` ключом развёртывания (секрет `DEPLOY_KEY`), дальше Argo CD. Итог `ok` выкатку не ждёт: в PR её нет.
+- **выкатка** (`deploy.yml`, вызывают шаблоны сервиса и фронтенда в `main` после публикации образа): ждёт кнопки (окружение `prod` с обязательным подтверждением в репозитории), затем `payments-deploy/scripts/set-image.sh` записывает тег образа в `envs/prod/services/<сервис>.yaml` ключом развёртывания (секрет `DEPLOY_KEY`), дальше Argo CD. Итог `ok` выкатку не ждёт: в PR её нет.
 - Итог — задача `ok`, проверка `ci / ok`: её требует защита `main`.
 - Действия закреплены по SHA коммита (тег можно переписать задним числом). `.github/dependabot.yml` в каждом репозитории — раз в неделю PR с обновлениями (minor и patch — одним PR; мажорные смены базовых образов — Java, Node — не предлагает: это решение вместе с `pom.xml` и CI; свою библиотеку обновляем сами).
 - Изменили шаблон в `payments-ci` совместимо — сдвинуть тег `v1`; несовместимо — тег `v2`, и репозитории переходят на него сами.
@@ -66,6 +67,8 @@ Java-сервисы: Java 21, Spring Boot 4, Maven. Каждый сервис �
 - **Кэш** (`platform.cache.enabled: true`): `@Cacheable` поверх Redis, TTL — `platform.cache.ttl.<кэш>`, префикс ключей `<сервис>:<version>:<кэш>:`; сбой Redis — запрос идёт мимо кэша.
 - **IdempotentResults**: итог операции по ключу идемпотентности в Redis (`SET NX` + TTL) — для заглушек внешних систем; `replace` — промежуточный итог (долгий перевод) сменился окончательным.
 - **Swagger** (у сервисов со springdoc): заголовок — имя сервиса, описание — `platform.openapi.description`; у каждой операции ответы `4XX`/`5XX` в формате ProblemDetail, в схеме `Problem` — коды `InputError` и все коды из enum ошибок сервиса (`platform.openapi.error-codes`).
+
+- **Наблюдаемость** (с 1.1.0): метрики для Prometheus с меткой `application` (сервис открывает `/actuator/prometheus` в `management.endpoints.web.exposure.include`), трассировка OpenTelemetry → OTLP. Куда слать трассы (`management.opentelemetry.tracing.export.otlp.endpoint`), долю запросов и JSON-логи (`logging.structured.format.console: ecs`, с `traceId`) задаёт окружение — в кластере `payments-deploy/envs/prod/env.yaml`; локально адреса нет — трассы не отправляются, логи обычным текстом. Kafka: payment публикует со своей трассой (`spring.kafka.template.observation-enabled`), history и biller продолжают её (`spring.kafka.listener.observation-enabled`). Outbox публикует по расписанию, поэтому событие — отдельная трасса, не продолжение HTTP-запроса.
 
 Тайм-ауты HTTP-клиентов по умолчанию — `spring.http.clients.connect-timeout` / `read-timeout` (1 с / 5 с).
 
@@ -269,13 +272,15 @@ account в Kafka не пишет (события резервов никто н�
   - `GET /api/history/operations/{id}` — карточка операции (чужую не отдаёт — 404)
   - `GET /api/history/categories` — справочник категорий
 
-Фронтенд ходит в сервисы через прокси Vite (`/api/users`, `/api/pricing`, `/api/payments`, `/api/history`). Авторизации пока нет: фронтенд работает от имени `00000000-0000-0000-0000-000000000001`.
+Фронтенд ходит в API только через **payments-gateway**: локально прокси Vite отправляет весь `/api` в gateway (`localhost:8080`), в кластере `/api` ведёт в gateway вход (Traefik). Gateway разводит запросы по сервисам (маршруты — его `application.yml`); `/api/internal/**` наружу не отдаёт — сервисы вызывают его друг у друга напрямую. Авторизации пока нет: фронтенд работает от имени `00000000-0000-0000-0000-000000000001`.
 
 ## Kubernetes (окружение)
 
-Одно окружение — локальный кластер k3d (k3s в Docker), всё описано в `payments-deploy` (подробно — его README). Argo CD внутри кластера раз в минуту сверяет кластер с `main` `payments-deploy` и приводит к описанию (GitOps): руками в кластере ничего не меняем.
-- Шаблон 9 Java-сервисов — `charts/java-service` (Deployment с пробами liveness/readiness/startup, памятью и обновлением без простоя, Service, Ingress), фронтенда — `charts/frontend`; настройки сервиса — `services/<сервис>.yaml`; базы и брокер — `infra/`; приложения Argo CD — `argocd/apps/`.
-- Адреса: приложение http://payments.localhost (пути `/api/users`, `/api/pricing`… ведут в сервисы, остальное — фронтенд), Argo CD http://argocd.localhost. Swagger и внутренние API — `kubectl -n payments port-forward svc/<сервис> <порт>`.
+Одно окружение `prod` — локальный кластер k3d (k3s в Docker), всё описано в `payments-deploy` (подробно — его README). Argo CD внутри кластера раз в минуту сверяет кластер с `main` `payments-deploy` и приводит к описанию (GitOps): руками в кластере ничего не меняем.
+- Раскладка: шаблоны — `charts/java-service` (Deployment с пробами liveness/readiness/startup, памятью и обновлением без простоя, Service, HTTPRoute, ServiceMonitor) и `charts/frontend`; общее для сервиса во всех окружениях — `services/<сервис>.yaml`; общее для компонентов платформы — `platform/<компонент>/values.yaml`; **всё, чем отличается окружение, — `envs/prod/`**: приложения Argo CD (`apps/`: ApplicationSet сервисов, инфраструктура, платформа), общие настройки сервисов (`env.yaml`), версии образов, число подов и память (`services/`), настройки платформы (`platform/`). Базы и брокер — `infra/`.
+- Вход: Traefik (Ingress-контроллер, ставит Argo CD) по правилам Gateway API (Gateway `external` + HTTPRoute): `payments.localhost/api` → gateway → сервисы, `payments.localhost/` → фронтенд.
+- Наблюдаемость (namespace `monitoring`): Prometheus + Grafana (kube-prometheus-stack), логи — Loki + Alloy, трассы — Jaeger. Alertmanager и правила тревог пока выключены — отдельная задача.
+- Адреса: приложение http://payments.localhost, Argo CD http://argocd.localhost, Grafana http://grafana.localhost, Prometheus http://prometheus.localhost, Jaeger http://jaeger.localhost, панель Traefik http://traefik.localhost/dashboard/. Swagger и внутренние API — `kubectl -n payments port-forward svc/<сервис> <порт>`.
 - Секреты — `payments-deploy/scripts/secrets.sh` из `payments-local/.env`, в git их нет.
 - Кластер и compose вместе в память не помещаются: `docker compose stop` перед `payments-deploy/scripts/cluster-up.sh`, `k3d cluster stop payments` перед `scripts/up.sh`.
 
