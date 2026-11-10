@@ -276,12 +276,11 @@ services:
       redis:
         condition: service_healthy
 
-  web:
+  # Вход в API: фронтенд ходит только сюда, gateway разводит запросы по сервисам (как в кластере)
+  gateway:
     restart: unless-stopped
-    # Цель dev — dev-сервер Vite с правками на лету; образ по умолчанию — боевой nginx (для Kubernetes)
     build:
-      context: ../payments-frontend
-      target: dev
+      context: ../payments-gateway
     environment:
       ACCOUNT_URL: http://account:8081
       PRICING_URL: http://pricing:8082
@@ -289,6 +288,20 @@ services:
       HISTORY_URL: http://history:8086
       BILLER_URL: http://biller:8087
       AUTOPAYMENTS_URL: http://autopayments:8089
+    ports:
+      - "8080:8080"
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/readiness"]
+
+  web:
+    restart: unless-stopped
+    # Цель dev — dev-сервер Vite с правками на лету; образ по умолчанию — боевой nginx (для Kubernetes)
+    build:
+      context: ../payments-frontend
+      target: dev
+    environment:
+      API_URL: http://gateway:8080
     ports:
       - "5173:5173"
     volumes:
