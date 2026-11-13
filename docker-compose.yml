@@ -276,7 +276,39 @@ services:
       redis:
         condition: service_healthy
 
-  # Вход в API: фронтенд ходит только сюда, gateway разводит запросы по сервисам (как в кластере)
+  # Вход пользователей (OpenID Connect) — как в кластере: realm payments, клиент payments-web, пользователь artur с id
+  # из сида account. Браузер ходит в Keycloak через dev-сервер Vite (http://localhost:5173/auth), поэтому адрес в токенах
+  # (iss) — http://localhost:5173/auth/realms/payments. Режим start-dev: база Keycloak — файл внутри контейнера,
+  # realm при каждом пересоздании контейнера импортируется заново из infra/keycloak/payments-realm.json
+  # (это копия realm из payments-deploy/charts/keycloak с адресом localhost — меняете realm там, меняйте и здесь).
+  # Пароли — из .env (scripts/up.sh создаёт их сам, если их нет). Админка — http://localhost:8180/auth/admin
+  keycloak:
+    restart: unless-stopped
+    image: quay.io/keycloak/keycloak:26.8.2
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?задайте KEYCLOAK_ADMIN_PASSWORD в .env (scripts/up.sh создаст сам)}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:?задайте DEMO_PASSWORD в .env (scripts/up.sh создаст сам)}
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HOSTNAME: http://localhost:5173/auth
+      # gateway берёт ключи по внутреннему адресу http://keycloak:8080 — ссылки ему отдаются на этот же адрес
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8180:8080"
+    healthcheck:
+      # curl в образе нет — запрос к пробе готовности через /dev/tcp оболочки
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /auth/health/ready HTTP/1.0\r\n\r\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Вход в API: фронтенд ходит только сюда, gateway разводит запросы по сервисам (как в кластере).
+  # Пропускает только с токеном Keycloak (OIDC_*), лимит запросов — в Redis
   gateway:
     restart: unless-stopped
     build:
@@ -288,6 +320,9 @@ services:
       HISTORY_URL: http://history:8086
       BILLER_URL: http://biller:8087
       AUTOPAYMENTS_URL: http://autopayments:8089
+      OIDC_ISSUER_URI: http://localhost:5173/auth/realms/payments
+      OIDC_JWK_SET_URI: http://keycloak:8080/auth/realms/payments/protocol/openid-connect/certs
+      REDIS_HOST: redis
     ports:
       - "8080:8080"
     healthcheck:
@@ -302,6 +337,8 @@ services:
       target: dev
     environment:
       API_URL: http://gateway:8080
+      # Страница входа и токены — через тот же dev-сервер (/auth), как в кластере через Traefik
+      AUTH_URL: http://keycloak:8080
     ports:
       - "5173:5173"
     volumes:

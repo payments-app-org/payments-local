@@ -81,7 +81,7 @@ Java-сервисы: Java 21, Spring Boot 4, Maven. Каждый сервис �
 
 ## Платёж по СБП и по карте (сага)
 
-`POST /api/payments` (payment) — заголовки `X-User-Id` (вместо авторизации) и `X-Idempotency-Key`.
+`POST /api/payments` (payment) — заголовки `X-User-Id` (ставит gateway из токена Keycloak) и `X-Idempotency-Key`.
 
 **Устройство payment.** Контроллер только принимает запрос; приём — `create/PaymentService` (ключ идемпотентности → котировка → подготовка → создание → сага). Подготовка своего вида — `PaymentPreparer` на каждый тип (`SbpPreparer`, `CardTransferPreparer`, `OwnTransferPreparer`, `WalletTransferPreparer`, `RequisitesPreparer`, `BillPreparer`, `AbroadPreparer`): проверка полей, получатель, реквизиты. Новый тип платежа — новый класс. Ошибки — enum `PaymentError`. Соседи — HTTP-интерфейсы (`client/*Api`, группы `spring.http.serviceclient.*`) через `ResilientCalls`: перевод в процессинг и оплату у поставщика повторяем только при ошибке соединения. Настройки — `payment.*` (минимальная сумма, БИК нашего банка, правила округления, группы с отложенным расчётом — пожертвования, пороги RecoveryJob).
 
@@ -272,23 +272,24 @@ account в Kafka не пишет (события резервов никто н�
   - `GET /api/history/operations/{id}` — карточка операции (чужую не отдаёт — 404)
   - `GET /api/history/categories` — справочник категорий
 
-Фронтенд ходит в API только через **payments-gateway**: локально прокси Vite отправляет весь `/api` в gateway (`localhost:8080`), в кластере `/api` ведёт в gateway вход (Traefik). Gateway разводит запросы по сервисам (маршруты — его `application.yml`); `/api/internal/**` наружу не отдаёт — сервисы вызывают его друг у друга напрямую. Авторизации пока нет: фронтенд работает от имени `00000000-0000-0000-0000-000000000001`.
+Фронтенд ходит в API только через **payments-gateway**: локально прокси Vite отправляет весь `/api` в gateway (`localhost:8080`), в кластере `/api` ведёт в gateway вход (Traefik). Gateway разводит запросы по сервисам (маршруты — его `application.yml`); `/api/internal/**` наружу не отдаёт — сервисы вызывают его друг у друга напрямую. **Вход — Keycloak** (OpenID Connect, Authorization Code + PKCE): фронтенд (`src/auth.ts`, oidc-client-ts) без токена отправляет на страницу входа `/auth` — тот же хост (в кластере маршрут Traefik, локально прокси Vite → Keycloak из compose). Каждый запрос в API — с `Authorization: Bearer <access-токен>` (5 минут, продлевается по refresh-токену). Gateway проверяет токен (подпись, срок, `iss`, `aud = payments-api`), ставит сервисам `X-User-Id` из claim `sub` (присланный клиентом выбрасывает), чужой id в пути, параметре или теле — 403, лимит 20 запросов/с на пользователя (Redis) — 429. Сервисы токен не проверяют и доверяют `X-User-Id`. Пользователь — `artur` (id `00000000-0000-0000-0000-000000000001` = id в account); пароль локально — `DEMO_PASSWORD` в `.env`, в кластере — `kubectl -n keycloak get secret keycloak -o jsonpath='{.data.demo-password}' | base64 -d`.
 
 ## Kubernetes (окружение)
 
 Одно окружение `prod` — локальный кластер k3d (k3s в Docker), всё описано в `payments-deploy` (подробно — его README). Argo CD внутри кластера раз в минуту сверяет кластер с `main` `payments-deploy` и приводит к описанию (GitOps): руками в кластере ничего не меняем.
 - Раскладка: шаблоны — `charts/java-service` (Deployment с пробами liveness/readiness/startup, памятью и обновлением без простоя, Service, HTTPRoute, ServiceMonitor) и `charts/frontend`; общее для сервиса во всех окружениях — `services/<сервис>.yaml`; общее для компонентов платформы — `platform/<компонент>/values.yaml`; **всё, чем отличается окружение, — `envs/prod/`**: приложения Argo CD (`apps/`: ApplicationSet сервисов, инфраструктура, платформа), общие настройки сервисов (`env.yaml`), версии образов, число подов и память (`services/`), настройки платформы (`platform/`). Базы и брокер — `infra/`.
-- Вход: Traefik (Ingress-контроллер, ставит Argo CD) по правилам Gateway API (Gateway `external` + HTTPRoute): `payments.localhost/api` → gateway → сервисы, `payments.localhost/` → фронтенд.
-- Наблюдаемость (namespace `monitoring`): Prometheus + Grafana (kube-prometheus-stack), логи — Loki + Alloy, трассы — Jaeger. Alertmanager и правила тревог пока выключены — отдельная задача.
-- Адреса: приложение http://payments.localhost, Argo CD http://argocd.localhost, Grafana http://grafana.localhost, Prometheus http://prometheus.localhost, Jaeger http://jaeger.localhost, панель Traefik http://traefik.localhost/dashboard/. Swagger и внутренние API — `kubectl -n payments port-forward svc/<сервис> <порт>`.
-- Секреты — `payments-deploy/scripts/secrets.sh` из `payments-local/.env`, в git их нет.
+- Вход: Traefik (Ingress-контроллер, ставит Argo CD) по правилам Gateway API (Gateway `external` + HTTPRoute): `payments.localhost/api` → gateway → сервисы, `payments.localhost/auth` → Keycloak, `payments.localhost/` → фронтенд.
+- Наблюдаемость (namespace `monitoring`): Prometheus + Grafana (kube-prometheus-stack, свои дашборды «Payments — сервисы» и «Безопасность и платформа»), логи — Loki + Alloy, трассы — Jaeger. Тревоги: правила (`platform/kube-prometheus-stack/manifests/rules-payments.yaml` + готовые kube-prometheus) → Alertmanager → Telegram-бот (`scripts/telegram.sh`).
+- Безопасность: Keycloak (namespace `keycloak`); сервисная сетка Istio ambient — mTLS STRICT между подами и AuthorizationPolicy «кто кому звонит» (`platform/mesh`: новый вызов между сервисами — добавить отправителя туда), NetworkPolicy по namespace; секреты — Vault + External Secrets.
+- Адреса: приложение http://payments.localhost, Argo CD http://argocd.localhost, Grafana http://grafana.localhost, Prometheus http://prometheus.localhost, Alertmanager http://alertmanager.localhost, Jaeger http://jaeger.localhost, Vault http://vault.localhost, панель Traefik http://traefik.localhost/dashboard/. Swagger и внутренние API — `kubectl -n payments port-forward svc/<сервис> <порт>`.
+- Секреты — в Vault: `payments-deploy/scripts/secrets.sh` кладёт туда ключи из `payments-local/.env` и создаёт пароли, External Secrets переносит их в Kubernetes; в git их нет.
 - Кластер и compose вместе в память не помещаются: `docker compose stop` перед `payments-deploy/scripts/cluster-up.sh`, `k3d cluster stop payments` перед `scripts/up.sh`.
 
 ## Запуск
 
 Java и Node на компьютер ставить не нужно — всё собирается и работает в Docker.
 
-Секреты — в `payments-local/.env` (в git не попадает): `cp .env.example .env` и заполнить (`openssl rand -base64 32`). Без них compose не запустится.
+Секреты — в `payments-local/.env` (в git не попадает): `cp .env.example .env` и заполнить (`openssl rand -base64 32`). Без них compose не запустится. Пароли Keycloak (`KEYCLOAK_ADMIN_PASSWORD`, `DEMO_PASSWORD`) `scripts/up.sh` создаёт сам. Вход в приложение на http://localhost:5173 — `artur` и `DEMO_PASSWORD` из `.env`; админка Keycloak — http://localhost:8180/auth/admin (`admin`, `KEYCLOAK_ADMIN_PASSWORD`).
 
 Токен для скачивания `payments-platform` (право `read:packages`): `scripts/up.sh` берёт его из `gh auth token`, либо задайте `GITHUB_TOKEN` в `.env`.
 
