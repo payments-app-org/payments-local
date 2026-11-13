@@ -17,7 +17,7 @@ jobs:
       - name: docker compose config
         run: |
           cp .env.example .env
-          sed -i 's/^\(QUOTE_SECRET\|CARD_HMAC_KEY\|CARD_ENCRYPTION_KEY\)=$/\1=ci-placeholder/' .env
+          sed -i 's/^\(QUOTE_SECRET\|CARD_HMAC_KEY\|CARD_ENCRYPTION_KEY\|KEYCLOAK_ADMIN_PASSWORD\|DEMO_PASSWORD\)=$/\1=ci-placeholder/' .env
           docker compose config -q
       - name: shellcheck
         run: cd scripts && shellcheck -x ./*.sh
